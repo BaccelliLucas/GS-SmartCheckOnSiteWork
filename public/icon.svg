@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <linearGradient id="metal" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#c3cacf"/>
+      <stop offset="0.45" stop-color="#7d868d"/>
+      <stop offset="1" stop-color="#3f464c"/>
+    </linearGradient>
+  </defs>
+  <g fill="url(#metal)">
+    <path fill-rule="evenodd" d="M50 1a49 49 0 1 0 0 98a49 49 0 1 0 0-98zm0 8a41 41 0 1 1 0 82a41 41 0 1 1 0-82z"/>
+    <rect x="32" y="6" width="8" height="88"/>
+    <rect x="60" y="6" width="8" height="88"/>
+    <rect x="36" y="45.5" width="28" height="9"/>
+    <path d="M27 23.6A35 35 0 0 0 27 76.4z"/>
+    <path d="M73 23.6A35 35 0 0 1 73 76.4z"/>
+  </g>
+</svg>
