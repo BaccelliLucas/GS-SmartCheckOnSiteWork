@@ -198,32 +198,91 @@ function storeRawFile(source: ImportSource) {
   }
 }
 
-const btravelBaseColumns = ['Matrícula', 'Data Embarque', 'Data Retorno']
+const btravelTripDateColumns = ['Data Embarque', 'Data Retorno']
+const btravelTripEdvColumns = ['EDV', 'Matrícula']
+const btravelBaseColumns = ['EDV', ...btravelTripDateColumns]
 
-// bTravel das bases antigas (Matrícula;Data Embarque;Data Retorno): cada linha é uma viagem do embarque ao retorno.
-// As viagens vão para btravel_trips e se somam a cada arquivo; não substituem nem são substituídas pelo Excel do bTravel
-function importBtravelBase(table: CsvTable) {
-  const insertTrip = database.prepare('INSERT OR IGNORE INTO btravel_trips (edv, start_date, end_date) VALUES (?, ?, ?)')
+function btravelTripEdvColumn(headers: string[]) {
+  return btravelTripEdvColumns.find(column => findColumn(headers, column) >= 0)
+}
+
+function isBtravelHeader(row: string[]) {
+  const hasTripInterval = Boolean(btravelTripEdvColumn(row)) && btravelTripDateColumns.every(column => findColumn(row, column) >= 0)
+  const hasMonthlyTravel = findColumn(row, 'Reporting 6') >= 0 && findColumn(row, 'Arrive Date') >= 0
+  return hasTripInterval || hasMonthlyTravel
+}
+
+// Alguns relatórios trazem títulos antes do cabeçalho real. Procura apenas cabeçalhos conhecidos para não
+// interferir nos demais layouts mensais, que continuam sendo armazenados como vieram.
+function withBtravelHeaders(table: CsvTable): CsvTable {
+  if (isBtravelHeader(table.headers)) return table
+  const headerIndex = table.rows.slice(0, 50).findIndex(isBtravelHeader)
+  return headerIndex < 0 ? table : { headers: table.rows[headerIndex].map(header => header.trim()), rows: table.rows.slice(headerIndex + 1) }
+}
+
+// O arquivo anual pode conter pessoas fora do universo do Smart Check. Considera conhecido o EDV que já
+// apareceu em ao menos uma das bases corporativas importadas; essas fontes são processadas antes do bTravel
+// quando fazem parte do mesmo envio.
+const knownEdv = database.prepare(`
+  SELECT 1
+  WHERE EXISTS (SELECT 1 FROM employee_snapshots WHERE edv = ?1)
+     OR EXISTS (SELECT 1 FROM access_days WHERE edv = ?1)
+     OR EXISTS (SELECT 1 FROM absence_records WHERE edv = ?1)
+     OR EXISTS (SELECT 1 FROM employee_units WHERE edv = ?1)
+     OR EXISTS (SELECT 1 FROM external_services WHERE edv = ?1)
+`)
+
+function tripPeriods(startDate: string, endDate: string) {
+  const [startYear, startMonth] = startDate.slice(0, 7).split('-').map(Number)
+  const [endYear, endMonth] = endDate.slice(0, 7).split('-').map(Number)
+  const periods: string[] = []
+  for (let cursor = Date.UTC(startYear, startMonth - 1, 1), end = Date.UTC(endYear, endMonth - 1, 1); cursor <= end; cursor = Date.UTC(new Date(cursor).getUTCFullYear(), new Date(cursor).getUTCMonth() + 1, 1)) {
+    const date = new Date(cursor)
+    periods.push(`${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`)
+  }
+  return periods
+}
+
+// bTravel por intervalo (EDV ou Matrícula; Data Embarque; Data Retorno): cada linha é uma viagem completa.
+// O arquivo pode reunir o ano inteiro; cada mês tocado recebe seu próprio vínculo para histórico e exclusão.
+function importBtravelTrips(table: CsvTable, edvColumn: string) {
+  const tripsByPeriod = new Map<string, Map<string, { edv: string; start: string; end: string }>>()
   let rows = 0
   let ignoredRows = 0
   for (const row of table.rows) {
-    const edv = normalizeEdv(rowValue(row, table.headers, 'Matrícula'))
+    const edv = normalizeEdv(rowValue(row, table.headers, edvColumn))
     if (!edv) continue
     const start = parseOptionalDate(rowValue(row, table.headers, 'Data Embarque'))
     const end = parseOptionalDate(rowValue(row, table.headers, 'Data Retorno')) || start
-    if (!/^\d+$/.test(edv) || !start) {
+    if (!/^\d+$/.test(edv) || !start || !knownEdv.get(edv)) {
       ignoredRows += 1
       continue
     }
-    insertTrip.run(edv, start, end < start ? start : end)
+    const normalizedEnd = end < start ? start : end
+    for (const period of tripPeriods(start, normalizedEnd)) {
+      if (!tripsByPeriod.has(period)) tripsByPeriod.set(period, new Map())
+      tripsByPeriod.get(period)!.set(`${edv}|${start}|${normalizedEnd}`, { edv, start, end: normalizedEnd })
+    }
     rows += 1
   }
-  if (rows === 0) throw new Error('bTravel: nenhuma linha com matrícula e data válidas.')
-  return { rows, ignoredRows, keepExistingImport: true }
+  if (rows === 0) throw new Error('bTravel: nenhuma linha com EDV conhecido e data de embarque válida.')
+  const insertTrip = database.prepare('INSERT INTO btravel_trips (period, edv, start_date, end_date) VALUES (?, ?, ?, ?)')
+  for (const [period, trips] of tripsByPeriod) {
+    database.prepare("DELETE FROM raw_source_files WHERE source = 'btravel' AND period = ?").run(period)
+    database.prepare('DELETE FROM btravel_trips WHERE period = ?').run(period)
+    for (const trip of trips.values()) insertTrip.run(period, trip.edv, trip.start, trip.end)
+  }
+  return {
+    rows,
+    ignoredRows,
+    importPeriods: [...tripsByPeriod].sort(([left], [right]) => left.localeCompare(right)).map(([period, trips]) => ({ period, rows: trips.size })),
+  }
 }
 
 function importBtravel(table: CsvTable, period: ReferencePeriod) {
-  if (btravelBaseColumns.every(column => findColumn(table.headers, column) >= 0)) return importBtravelBase(table)
+  const edvColumn = btravelTripEdvColumn(table.headers)
+  if (edvColumn && btravelTripDateColumns.every(column => findColumn(table.headers, column) >= 0)) return importBtravelTrips(table, edvColumn)
+  database.prepare('DELETE FROM btravel_trips WHERE period = ?').run(formatPeriod(period))
   return storeRawFile('btravel')(table, period)
 }
 
@@ -287,8 +346,9 @@ function importExceptions(sourceTable: CsvTable, period: ReferencePeriod) {
   return { rows: exclusions.size, ignoredRows: 0 }
 }
 
-// keepExistingImport: não troca o arquivo já registrado no histórico daquele mês (as bases antigas do bTravel se somam a ele)
-const importers: Record<ImportSource, (table: CsvTable, period: ReferencePeriod) => { rows: number; ignoredRows: number; keepExistingImport?: boolean }> = {
+type ImportResult = { rows: number; ignoredRows: number; importPeriods?: { period: string; rows: number }[] }
+
+const importers: Record<ImportSource, (table: CsvTable, period: ReferencePeriod) => ImportResult> = {
   lenel: importLenel,
   it007: importIt007,
   it2001: importIt2001,
@@ -302,7 +362,7 @@ export function importSourceFiles(sourceFiles: SourceFile[], period: ReferencePe
   if (sourceFiles.length === 0) throw new Error('Selecione ao menos um arquivo.')
   const files = sourceFiles.map(file => {
     const table = withHeaderRow(file.table, requiredColumns[file.source])
-    return { ...file, table: file.source === 'lenel' ? withLenelHeaders(table) : table }
+    return { ...file, table: file.source === 'lenel' ? withLenelHeaders(table) : file.source === 'btravel' ? withBtravelHeaders(table) : table }
   })
   for (const file of files) {
     try {
@@ -313,15 +373,18 @@ export function importSourceFiles(sourceFiles: SourceFile[], period: ReferencePe
   }
 
   const periodKey = formatPeriod(period)
-  const results: Partial<Record<ImportSource, { rows: number; ignoredRows: number }>> = {}
+  const results: Partial<Record<ImportSource, { rows: number; ignoredRows: number; periods?: string[] }>> = {}
   database.exec('BEGIN IMMEDIATE')
   try {
     const registerImport = database.prepare('INSERT OR REPLACE INTO source_imports (source, period, file_name, row_count, imported_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
-    const registerIfMissing = database.prepare('INSERT OR IGNORE INTO source_imports (source, period, file_name, row_count, imported_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
     for (const file of files) {
-      const { keepExistingImport, ...result } = importers[file.source](file.table, period)
-      ;(keepExistingImport ? registerIfMissing : registerImport).run(file.source, periodKey, file.fileName, result.rows)
-      results[file.source] = result
+      const { importPeriods, ...result } = importers[file.source](file.table, period)
+      if (importPeriods) {
+        for (const importedPeriod of importPeriods) registerImport.run(file.source, importedPeriod.period, file.fileName, importedPeriod.rows)
+      } else {
+        registerImport.run(file.source, periodKey, file.fileName, result.rows)
+      }
+      results[file.source] = { ...result, periods: importPeriods?.map(item => item.period) }
     }
     database.exec('COMMIT')
   } catch (error) {
@@ -342,7 +405,7 @@ export function removeSourceImport(source: ImportSource, periodKey: string) {
     lenel: [['DELETE FROM access_days WHERE access_date BETWEEN ? AND ?', firstDay, lastDay]],
     it007: [['DELETE FROM employee_snapshots WHERE period = ?', periodKey]],
     it2001: [['DELETE FROM absence_records WHERE period = ?', periodKey], ['DELETE FROM employee_units WHERE period = ?', periodKey]],
-    btravel: [['DELETE FROM raw_source_files WHERE source = ? AND period = ?', 'btravel', periodKey]],
+    btravel: [['DELETE FROM raw_source_files WHERE source = ? AND period = ?', 'btravel', periodKey], ['DELETE FROM btravel_trips WHERE period = ?', periodKey]],
     external: [['DELETE FROM external_services WHERE period = ?', periodKey]],
     exceptions: [['DELETE FROM excluded_employees WHERE period = ?', periodKey]],
   }
@@ -389,8 +452,8 @@ export function exportSourceImport(source: ImportSource, periodKey: string): Csv
     btravel: () => {
       const file = database.prepare("SELECT headers, rows FROM raw_source_files WHERE source = 'btravel' AND period = ?").get(periodKey) as { headers: string; rows: string } | undefined
       if (file) return { headers: JSON.parse(file.headers), rows: JSON.parse(file.rows) }
-      // Mês registrado só por bases antigas (TXT): viagens que passam pelo mês
-      return { headers: btravelBaseColumns, rows: query('SELECT edv, start_date, end_date FROM btravel_trips WHERE start_date <= ? AND end_date >= ? ORDER BY start_date, edv', lastDay, firstDay) }
+      // Mês registrado por arquivo de intervalos: somente os vínculos preservados para esse mês
+      return { headers: btravelBaseColumns, rows: query('SELECT edv, start_date, end_date FROM btravel_trips WHERE period = ? ORDER BY start_date, edv', periodKey) }
     },
     external: () => ({ headers: ['EDV', 'Data', 'Local'], rows: query('SELECT edv, service_date, location FROM external_services WHERE period = ? ORDER BY service_date, edv', periodKey) }),
     exceptions: () => ({ headers: ['EDV', 'Nome', 'HRBP', 'Justificativa'], rows: query('SELECT edv, full_name, hrbp, justification FROM excluded_employees WHERE period = ? ORDER BY edv', periodKey) }),

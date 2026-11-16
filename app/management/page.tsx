@@ -68,7 +68,7 @@ const uploadDefinitions: { key: UploadKey; name: string; description: string; ac
   { key: 'lenel', name: 'Lenel', description: 'Registros de acesso e entradas de catraca', accent: '#1475bd' },
   { key: 'it007', name: 'IT007', description: 'Base organizacional e dados dos colaboradores', accent: '#269a7d' },
   { key: 'it2001', name: 'IT2001', description: 'Informações de ausências', accent: '#b16d19' },
-  { key: 'btravel', name: 'bTravel', description: 'Colaboradores que viajaram no mês', accent: '#6a4fb3' },  { key: 'external', name: 'BIS - ITV', description: 'Registro de acesso e entradas em Itupeva', accent: '#0f8a9d' },
+  { key: 'btravel', name: 'bTravel', description: 'Viagens mensais ou arquivo anual por embarque e retorno', accent: '#6a4fb3' },  { key: 'external', name: 'BIS - ITV', description: 'Registro de acesso e entradas em Itupeva', accent: '#0f8a9d' },
   { key: 'exceptions', name: 'Exceções', description: 'EDVs que não devem aparecer no dashboard', accent: '#c64550' },
 ]
 
@@ -359,10 +359,15 @@ export default function ManagementPage() {
       for (const upload of selectedUploads) formData.append(upload.key, files[upload.key]!)
 
       const response = await fetch('/api/management/import', { method: 'POST', body: formData })
-      const result = await response.json() as { error?: string; results?: Partial<Record<UploadKey, { rows: number; ignoredRows: number }>> }
+      const result = await response.json() as { error?: string; results?: Partial<Record<UploadKey, { rows: number; ignoredRows: number; periods?: string[] }>> }
       if (!response.ok) throw new Error(result.error || 'Não foi possível importar os arquivos.')
       const ignoredLenelRows = result.results?.lenel?.ignoredRows ?? 0
-      setSavedMessage(`${selectedUploads.map(upload => upload.name).join(', ')} ${selectedUploads.length === 1 ? 'importado' : 'importados'} para ${formatPeriodLabel(referencePeriodKey)}.${ignoredLenelRows ? ` ${ignoredLenelRows.toLocaleString('pt-BR')} linhas do Lenel de outros meses foram ignoradas.` : ''}`)
+      const ignoredBtravelRows = result.results?.btravel?.ignoredRows ?? 0
+      const btravelPeriods = result.results?.btravel?.periods ?? []
+      const destination = btravelPeriods.length
+        ? ` O bTravel foi registrado em ${btravelPeriods.map(formatPeriodLabel).join(', ')}.`
+        : ` para ${formatPeriodLabel(referencePeriodKey)}.`
+      setSavedMessage(`${selectedUploads.map(upload => upload.name).join(', ')} ${selectedUploads.length === 1 ? 'importado' : 'importados'}.${destination}${ignoredLenelRows ? ` ${ignoredLenelRows.toLocaleString('pt-BR')} linhas do Lenel de outros meses foram ignoradas.` : ''}${ignoredBtravelRows ? ` ${ignoredBtravelRows.toLocaleString('pt-BR')} linhas do bTravel com EDV desconhecido ou dados inválidos foram ignoradas.` : ''}`)
       setSaved(true)
       setFiles(noFiles)
       setFileInputsKey(current => current + 1)

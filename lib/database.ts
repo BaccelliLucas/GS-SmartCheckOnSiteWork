@@ -24,6 +24,18 @@ export function markDataChanged() {
   dataVersionHolder.smartCheckDataVersion = dataVersion() + 1
 }
 
+function monthsInRange(startDate: string, endDate: string) {
+  const [startYear, startMonth] = startDate.slice(0, 7).split('-').map(Number)
+  const [endYear, endMonth] = endDate.slice(0, 7).split('-').map(Number)
+  if (!startYear || !startMonth || !endYear || !endMonth) return []
+  const periods: string[] = []
+  for (let cursor = Date.UTC(startYear, startMonth - 1, 1), end = Date.UTC(endYear, endMonth - 1, 1); cursor <= end; cursor = Date.UTC(new Date(cursor).getUTCFullYear(), new Date(cursor).getUTCMonth() + 1, 1)) {
+    const date = new Date(cursor)
+    periods.push(`${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`)
+  }
+  return periods
+}
+
 database.exec(`
   PRAGMA journal_mode = WAL;
   PRAGMA synchronous = NORMAL;
@@ -101,13 +113,14 @@ database.exec(`
     PRIMARY KEY (source, period)
   ) WITHOUT ROWID;
 
-  -- Viagens das bases antigas do bTravel (TXT Matrícula;Data Embarque;Data Retorno): ficam guardadas de forma
-  -- permanente, sem mês de referência, e nenhuma importação as apaga
+  -- Viagens do bTravel informadas por intervalo. Uma viagem que atravessa meses recebe um vínculo com cada mês,
+  -- permitindo mostrar e excluir cada mês separadamente no histórico de importações.
   CREATE TABLE IF NOT EXISTS btravel_trips (
+    period TEXT NOT NULL,
     edv TEXT NOT NULL,
     start_date TEXT NOT NULL,
     end_date TEXT NOT NULL,
-    PRIMARY KEY (edv, start_date, end_date)
+    PRIMARY KEY (period, edv, start_date, end_date)
   ) WITHOUT ROWID;
 
   -- Serviço externo (EDV, Data, Local) por mês de referência: em dia útil conta como presença, como o bTravel
@@ -175,6 +188,43 @@ database.exec(`
     setting_value TEXT NOT NULL
   );
 `)
+
+// Migra o formato anterior, no qual as viagens por intervalo não tinham vínculo mensal. O mesmo intervalo é
+// associado a todos os meses que ele toca, sem alterar suas datas originais.
+const btravelTripColumns = new Set((database.prepare('PRAGMA table_info(btravel_trips)').all() as unknown as { name: string }[]).map(column => column.name))
+if (!btravelTripColumns.has('period')) {
+  const oldTrips = database.prepare('SELECT edv, start_date, end_date FROM btravel_trips').all() as unknown as { edv: string; start_date: string; end_date: string }[]
+  const latestImport = database.prepare("SELECT file_name, imported_at FROM source_imports WHERE source = 'btravel' ORDER BY imported_at DESC LIMIT 1").get() as { file_name: string; imported_at: string } | undefined
+  const rowsByPeriod = new Map<string, number>()
+  database.exec('BEGIN IMMEDIATE')
+  try {
+    database.exec(`
+      CREATE TABLE btravel_trips_new (
+        period TEXT NOT NULL,
+        edv TEXT NOT NULL,
+        start_date TEXT NOT NULL,
+        end_date TEXT NOT NULL,
+        PRIMARY KEY (period, edv, start_date, end_date)
+      ) WITHOUT ROWID;
+    `)
+    const insertTrip = database.prepare('INSERT OR IGNORE INTO btravel_trips_new (period, edv, start_date, end_date) VALUES (?, ?, ?, ?)')
+    for (const trip of oldTrips) {
+      for (const period of monthsInRange(trip.start_date, trip.end_date)) {
+        const inserted = insertTrip.run(period, trip.edv, trip.start_date, trip.end_date)
+        if (Number(inserted.changes)) rowsByPeriod.set(period, (rowsByPeriod.get(period) ?? 0) + 1)
+      }
+    }
+    if (latestImport) {
+      const registerMonth = database.prepare("INSERT OR IGNORE INTO source_imports (source, period, file_name, row_count, imported_at) VALUES ('btravel', ?, ?, ?, ?)")
+      for (const [period, rows] of rowsByPeriod) registerMonth.run(period, latestImport.file_name, rows, latestImport.imported_at)
+    }
+    database.exec('DROP TABLE btravel_trips; ALTER TABLE btravel_trips_new RENAME TO btravel_trips;')
+    database.exec('COMMIT')
+  } catch (error) {
+    database.exec('ROLLBACK')
+    throw error
+  }
+}
 
 // Torna explícitas e configuráveis as regras por contrato que já fazem parte da política de presença
 const contractTargetsSeedKey = 'contract_presence_targets_seeded_v1'

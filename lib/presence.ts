@@ -152,8 +152,8 @@ function numericEdv(value: string) {
 function travelDaysByEdv(firstDay: string, lastDay: string) {
   const files = database.prepare("SELECT headers, rows FROM raw_source_files WHERE source = 'btravel'").all() as unknown as { headers: string; rows: string }[]
   const ranges = new Map<string, [string, string][]>()
-  // Bases antigas do bTravel (TXT): viagens já montadas, do embarque ao retorno
-  for (const trip of database.prepare('SELECT edv, start_date, end_date FROM btravel_trips WHERE start_date <= ? AND end_date >= ?').all(lastDay, firstDay) as unknown as { edv: string; start_date: string; end_date: string }[]) {
+  // Arquivos do bTravel por intervalo (inclusive o anual): viagens já montadas, do embarque ao retorno
+  for (const trip of database.prepare('SELECT edv, start_date, end_date FROM btravel_trips WHERE period = ? AND start_date <= ? AND end_date >= ?').all(firstDay.slice(0, 7), lastDay, firstDay) as unknown as { edv: string; start_date: string; end_date: string }[]) {
     ranges.set(trip.edv, [...(ranges.get(trip.edv) ?? []), [trip.start_date, trip.end_date]])
   }
   for (const file of files) {
